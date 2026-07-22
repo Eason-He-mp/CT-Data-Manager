@@ -32,8 +32,7 @@ jobs:
         # --noconsole: 运行时不显示黑色的 CMD 控制台窗口
         # --onefile: 打包成单文件 exe
         # --name: 指定输出的 exe 文件名
-        pyinstaller --noconsole --onefile --name "ct data manager" ct data manager.py
-
+        pyinstaller --noconsole --onefile --name "ct data manager" CT_Data_Manager.py
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
