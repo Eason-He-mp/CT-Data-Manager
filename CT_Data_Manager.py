@@ -37,24 +37,21 @@ def get_creation_time(path):
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具 (带尺寸过滤 & 其他分类)")
+        self.root.title("CT 数据容量统计工具")
         self.root.geometry("950x650")
         self.root.configure(bg="#f0f0f0")
         
-        self.data = {} # 存储扫描结果
+        self.data = {} 
         
         self.setup_ui()
 
     def setup_ui(self):
-        # 顶部控制栏
         top_frame = tk.Frame(self.root, bg="#ffffff", pady=15)
         top_frame.pack(fill=tk.X)
 
-        # 标题
         title_label = tk.Label(top_frame, text="📊 CT 数据统计", font=("Arial", 16, "bold"), bg="#ffffff")
         title_label.pack(side=tk.LEFT, padx=15)
 
-        # 过滤器设置区域
         filter_frame = tk.Frame(top_frame, bg="#ffffff")
         filter_frame.pack(side=tk.LEFT, padx=20)
 
@@ -65,14 +62,13 @@ class CTDataApp:
         )
         self.filter_checkbox.pack(side=tk.LEFT)
 
-        self.threshold_var = tk.StringVar(value="1.0") # 默认 1.0 GB
+        self.threshold_var = tk.StringVar(value="1.0") 
         self.threshold_entry = ttk.Entry(filter_frame, textvariable=self.threshold_var, width=5, state=tk.DISABLED)
         self.threshold_entry.pack(side=tk.LEFT, padx=(5, 2))
         
         self.unit_label = tk.Label(filter_frame, text="GB", bg="#ffffff", fg="#888888")
         self.unit_label.pack(side=tk.LEFT)
 
-        # 扫描按钮和状态
         self.scan_btn = ttk.Button(top_frame, text="📁 选择文件夹并扫描", command=self.start_scan)
         self.scan_btn.pack(side=tk.RIGHT, padx=15)
 
@@ -80,7 +76,6 @@ class CTDataApp:
         status_label = tk.Label(top_frame, textvariable=self.status_var, bg="#ffffff", fg="#666666")
         status_label.pack(side=tk.RIGHT, padx=10)
 
-        # 主体内容区 (带滚动条的 Canvas)
         self.canvas = tk.Canvas(self.root, bg="#f0f0f0", highlightthickness=0)
         self.scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = tk.Frame(self.canvas, bg="#f0f0f0")
@@ -97,7 +92,6 @@ class CTDataApp:
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     def toggle_filter_input(self):
-        """根据复选框状态启用/禁用输入框"""
         if self.use_filter_var.get():
             self.threshold_entry.config(state=tk.NORMAL)
             self.unit_label.config(fg="#000000")
@@ -106,7 +100,6 @@ class CTDataApp:
             self.unit_label.config(fg="#888888")
 
     def start_scan(self):
-        # 获取过滤阈值 (字节)
         threshold_bytes = 0
         if self.use_filter_var.get():
             try:
@@ -132,16 +125,19 @@ class CTDataApp:
         threading.Thread(target=self.scan_process, args=(base_dir, threshold_bytes), daemon=True).start()
 
     def scan_process(self, base_dir, threshold_bytes):
-        nasuni_pattern = re.compile(r'^[Nn]_?FACT-\d{6}')
-        normal_pattern = re.compile(r'^FACT-\d{6}')
+        # 匹配 N-FACT, n-FACT, N_FACT, n_FACT, NFACT, nFACT (只要包含即可，不要求在开头)
+        nasuni_pattern = re.compile(r'[Nn][-_\s]?FACT')
         cutoff_date = datetime.now() - timedelta(days=90)
 
         self.data = {}
         filtered_count = 0
 
         try:
-            for engineer_name in os.listdir(base_dir):
+            engineers = [d for d in os.listdir(base_dir) if not d.startswith('.') and d not in ['System Volume Information', '$RECYCLE.BIN']]
+
+            for engineer_name in engineers:
                 eng_path = os.path.join(base_dir, engineer_name)
+                
                 if not os.path.isdir(eng_path):
                     continue
 
@@ -150,9 +146,28 @@ class CTDataApp:
                 other_projects = []
                 other_total_size = 0
 
-                for project_name in os.listdir(eng_path):
+                try:
+                    items_in_eng_dir = os.listdir(eng_path)
+                except PermissionError:
+                    print(f"权限拒绝: 无法访问 {eng_path}，已跳过。")
+                    continue
+
+                for project_name in items_in_eng_dir:
                     proj_path = os.path.join(eng_path, project_name)
+                    
                     if not os.path.isdir(proj_path):
+                        try:
+                            file_size = os.path.getsize(proj_path)
+                        except OSError:
+                            file_size = 0
+                            
+                        other_total_size += file_size
+                        eng_total_size += file_size
+                        other_projects.append({
+                            'name': f"📄 [文件] {project_name}", 'category': "Other", 
+                            'age': "-", 'date': "-", 
+                            'size': file_size, 'size_str': format_size(file_size)
+                        })
                         continue
 
                     proj_size = get_dir_size(proj_path)
@@ -167,7 +182,8 @@ class CTDataApp:
                     creation_date = datetime.fromtimestamp(ctime)
                     age_status = "> 90 Days" if creation_date < cutoff_date else "<= 90 Days"
 
-                    # 判断是否为标准命名
+                    # 匹配逻辑更新：
+                    # 1. 优先检查是否包含 Nasuni 前缀的 FACT
                     if nasuni_pattern.search(project_name):
                         category = "Nasuni Uploaded"
                         standard_projects.append({
@@ -175,35 +191,35 @@ class CTDataApp:
                             'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
                             'size': proj_size, 'size_str': format_size(proj_size)
                         })
-                    elif normal_pattern.search(project_name):
+                    # 2. 如果不满足上述条件，但包含 "FACT" 字符串，则为 Standard CT
+                    elif "FACT" in project_name:
                         category = "Standard CT"
                         standard_projects.append({
                             'name': project_name, 'category': category, 
                             'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
                             'size': proj_size, 'size_str': format_size(proj_size)
                         })
+                    # 3. 都不满足，归类为 Other
                     else:
-                        # 归类为 Other (非标准命名)
                         other_total_size += proj_size
                         other_projects.append({
-                            'name': project_name, 'category': "Other", 
-                            'age': "-", 'date': "-", # Other 类别简化显示
+                            'name': f"📁 {project_name}", 'category': "Other", 
+                            'age': "-", 'date': "-", 
                             'size': proj_size, 'size_str': format_size(proj_size)
                         })
 
-                if standard_projects or other_projects:
-                    self.data[engineer_name] = {
-                        'total_size': eng_total_size,
-                        'total_size_str': format_size(eng_total_size),
-                        'standard_projects': standard_projects,
-                        'other_projects': other_projects,
-                        'other_total_size': other_total_size
-                    }
+                self.data[engineer_name] = {
+                    'total_size': eng_total_size,
+                    'total_size_str': format_size(eng_total_size),
+                    'standard_projects': standard_projects,
+                    'other_projects': other_projects,
+                    'other_total_size': other_total_size
+                }
 
             self.root.after(0, self.render_engineer_cards, filtered_count)
             
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("错误", f"扫描过程中出现错误: {str(e)}"))
+            self.root.after(0, lambda err=e: messagebox.showerror("严重错误", f"扫描过程中出现异常: {str(err)}"))
             self.root.after(0, self.reset_ui_state)
 
     def reset_ui_state(self):
@@ -261,11 +277,9 @@ class CTDataApp:
         tk.Label(summary_frame, text=f"工程师: {engineer_name}", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
         tk.Label(summary_frame, text=f"总占用: {info['total_size_str']}", font=("Arial", 12), fg="#0066cc").pack(side=tk.RIGHT)
 
-        # 使用 tree 模式显示数据 (移除 show="headings"，保留默认的树状列 #0)
         columns = ("Category", "Age", "Date", "Size")
         tree = ttk.Treeview(detail_win, columns=columns)
         
-        # 配置树状列 (用于显示文件名和折叠图标)
         tree.heading("#0", text="工程文件夹 / 文件名")
         tree.column("#0", width=300, anchor="w")
 
@@ -279,7 +293,6 @@ class CTDataApp:
         tree.column("Date", width=100)
         tree.column("Size", width=100, anchor="e")
 
-        # 1. 插入标准命名的工程 (直接在根节点显示)
         sorted_standard = sorted(info['standard_projects'], key=lambda x: x['size'], reverse=True)
         for proj in sorted_standard:
             tree.insert("", tk.END, text=proj['name'], values=(
@@ -289,24 +302,19 @@ class CTDataApp:
                 proj['size_str']
             ))
 
-        # 2. 如果有 Other 类别，创建一个父节点
         if info['other_projects']:
-            other_title = f"📁 Others (非标准命名) - 共 {len(info['other_projects'])} 个"
+            other_title = f"📁 Others (非标准命名/零散文件) - 共 {len(info['other_projects'])} 个"
             other_size_str = format_size(info['other_total_size'])
             
-            # 插入父节点 (默认折叠)
             other_node = tree.insert("", tk.END, text=other_title, values=(
                 "Other Group", "-", "-", other_size_str
             ), tags=('other_group',))
 
-            # 设置父节点样式 (加粗)
             tree.tag_configure('other_group', font=('Arial', 10, 'bold'), background='#f5f5f5')
 
-            # 将具体的 Other 文件夹作为子节点插入
             sorted_others = sorted(info['other_projects'], key=lambda x: x['size'], reverse=True)
             for proj in sorted_others:
-                # 子节点只显示文件名和大小，其他列留空
-                tree.insert(other_node, tk.END, text=f"📄 {proj['name']}", values=(
+                tree.insert(other_node, tk.END, text=proj['name'], values=(
                     "", "", "", proj['size_str']
                 ))
 
