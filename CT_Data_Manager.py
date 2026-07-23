@@ -46,7 +46,7 @@ def get_creation_time(path):
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具 (极速多线程版)")
+        self.root.title("CT 数据容量统计工具")
         self.root.geometry("950x650")
         self.root.configure(bg="#f0f0f0")
         
