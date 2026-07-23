@@ -4,18 +4,27 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def get_dir_size(start_path):
-    """递归计算文件夹大小（字节）"""
+    """使用 os.scandir 替代 os.walk，大幅加速目录遍历和大小计算"""
     total_size = 0
-    for dirpath, dirnames, filenames in os.walk(start_path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if not os.path.islink(fp):
-                try:
-                    total_size += os.path.getsize(fp)
-                except OSError:
-                    pass
+    dirs_to_process = [start_path]
+    
+    while dirs_to_process:
+        current_dir = dirs_to_process.pop()
+        try:
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_file():
+                        # 直接获取缓存的 stat 信息，极快
+                        total_size += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir():
+                        dirs_to_process.append(entry.path)
+        except OSError:
+            pass # 忽略权限不足的文件夹
     return total_size
 
 def format_size(size_in_bytes):
@@ -37,7 +46,7 @@ def get_creation_time(path):
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具")
+        self.root.title("CT 数据容量统计工具 (极速多线程版)")
         self.root.geometry("950x650")
         self.root.configure(bg="#f0f0f0")
         
@@ -117,110 +126,142 @@ class CTDataApp:
         self.filter_checkbox.config(state=tk.DISABLED)
         self.threshold_entry.config(state=tk.DISABLED)
         
-        self.status_var.set(f"正在扫描: {base_dir}，请耐心等待...")
+        self.status_var.set(f"正在初始化扫描: {base_dir}...")
         
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
 
-        threading.Thread(target=self.scan_process, args=(base_dir, threshold_bytes), daemon=True).start()
+        # 启动后台主控线程
+        threading.Thread(target=self.scan_manager, args=(base_dir, threshold_bytes), daemon=True).start()
 
-    def scan_process(self, base_dir, threshold_bytes):
-        # 匹配 N-FACT, n-FACT, N_FACT, n_FACT, NFACT, nFACT (只要包含即可，不要求在开头)
+    def process_single_engineer(self, base_dir, engineer_name, threshold_bytes, cutoff_date, nasuni_pattern):
+        """处理单个工程师的数据（在独立线程中运行）"""
+        eng_path = os.path.join(base_dir, engineer_name)
+        
+        eng_total_size = 0
+        standard_projects = []
+        other_projects = []
+        other_total_size = 0
+        local_filtered_count = 0
+
+        try:
+            items_in_eng_dir = os.listdir(eng_path)
+        except PermissionError:
+            return engineer_name, None, 0 # 没有权限，返回空数据
+
+        for project_name in items_in_eng_dir:
+            proj_path = os.path.join(eng_path, project_name)
+            
+            if not os.path.isdir(proj_path):
+                try:
+                    file_size = os.path.getsize(proj_path)
+                except OSError:
+                    file_size = 0
+                    
+                other_total_size += file_size
+                eng_total_size += file_size
+                other_projects.append({
+                    'name': f"📄 [文件] {project_name}", 'category': "Other", 
+                    'age': "-", 'date': "-", 
+                    'size': file_size, 'size_str': format_size(file_size)
+                })
+                continue
+
+            proj_size = get_dir_size(proj_path)
+
+            if threshold_bytes > 0 and proj_size < threshold_bytes:
+                local_filtered_count += 1
+                continue
+
+            eng_total_size += proj_size
+
+            ctime = get_creation_time(proj_path)
+            creation_date = datetime.fromtimestamp(ctime)
+            age_status = "> 90 Days" if creation_date < cutoff_date else "<= 90 Days"
+
+            if nasuni_pattern.search(project_name):
+                category = "Nasuni Uploaded"
+                standard_projects.append({
+                    'name': project_name, 'category': category, 
+                    'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
+                    'size': proj_size, 'size_str': format_size(proj_size)
+                })
+            elif "FACT" in project_name:
+                category = "Standard CT"
+                standard_projects.append({
+                    'name': project_name, 'category': category, 
+                    'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
+                    'size': proj_size, 'size_str': format_size(proj_size)
+                })
+            else:
+                other_total_size += proj_size
+                other_projects.append({
+                    'name': f"📁 {project_name}", 'category': "Other", 
+                    'age': "-", 'date': "-", 
+                    'size': proj_size, 'size_str': format_size(proj_size)
+                })
+
+        result_data = {
+            'total_size': eng_total_size,
+            'total_size_str': format_size(eng_total_size),
+            'standard_projects': standard_projects,
+            'other_projects': other_projects,
+            'other_total_size': other_total_size
+        }
+        
+        return engineer_name, result_data, local_filtered_count
+
+    def scan_manager(self, base_dir, threshold_bytes):
+        """管理多线程扫描的主控函数"""
         nasuni_pattern = re.compile(r'[Nn][-_\s]?FACT')
         cutoff_date = datetime.now() - timedelta(days=90)
 
         self.data = {}
-        filtered_count = 0
+        total_filtered_count = 0
 
         try:
-            engineers = [d for d in os.listdir(base_dir) if not d.startswith('.') and d not in ['System Volume Information', '$RECYCLE.BIN']]
+            # 获取所有有效的工程师文件夹
+            engineers = [d for d in os.listdir(base_dir) 
+                         if not d.startswith('.') 
+                         and d not in ['System Volume Information', '$RECYCLE.BIN']
+                         and os.path.isdir(os.path.join(base_dir, d))]
+            
+            total_engineers = len(engineers)
+            completed_engineers = 0
 
-            for engineer_name in engineers:
-                eng_path = os.path.join(base_dir, engineer_name)
-                
-                if not os.path.isdir(eng_path):
-                    continue
-
-                eng_total_size = 0
-                standard_projects = []
-                other_projects = []
-                other_total_size = 0
-
-                try:
-                    items_in_eng_dir = os.listdir(eng_path)
-                except PermissionError:
-                    print(f"权限拒绝: 无法访问 {eng_path}，已跳过。")
-                    continue
-
-                for project_name in items_in_eng_dir:
-                    proj_path = os.path.join(eng_path, project_name)
-                    
-                    if not os.path.isdir(proj_path):
-                        try:
-                            file_size = os.path.getsize(proj_path)
-                        except OSError:
-                            file_size = 0
-                            
-                        other_total_size += file_size
-                        eng_total_size += file_size
-                        other_projects.append({
-                            'name': f"📄 [文件] {project_name}", 'category': "Other", 
-                            'age': "-", 'date': "-", 
-                            'size': file_size, 'size_str': format_size(file_size)
-                        })
-                        continue
-
-                    proj_size = get_dir_size(proj_path)
-
-                    if threshold_bytes > 0 and proj_size < threshold_bytes:
-                        filtered_count += 1
-                        continue
-
-                    eng_total_size += proj_size
-
-                    ctime = get_creation_time(proj_path)
-                    creation_date = datetime.fromtimestamp(ctime)
-                    age_status = "> 90 Days" if creation_date < cutoff_date else "<= 90 Days"
-
-                    # 匹配逻辑更新：
-                    # 1. 优先检查是否包含 Nasuni 前缀的 FACT
-                    if nasuni_pattern.search(project_name):
-                        category = "Nasuni Uploaded"
-                        standard_projects.append({
-                            'name': project_name, 'category': category, 
-                            'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
-                            'size': proj_size, 'size_str': format_size(proj_size)
-                        })
-                    # 2. 如果不满足上述条件，但包含 "FACT" 字符串，则为 Standard CT
-                    elif "FACT" in project_name:
-                        category = "Standard CT"
-                        standard_projects.append({
-                            'name': project_name, 'category': category, 
-                            'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
-                            'size': proj_size, 'size_str': format_size(proj_size)
-                        })
-                    # 3. 都不满足，归类为 Other
-                    else:
-                        other_total_size += proj_size
-                        other_projects.append({
-                            'name': f"📁 {project_name}", 'category': "Other", 
-                            'age': "-", 'date': "-", 
-                            'size': proj_size, 'size_str': format_size(proj_size)
-                        })
-
-                self.data[engineer_name] = {
-                    'total_size': eng_total_size,
-                    'total_size_str': format_size(eng_total_size),
-                    'standard_projects': standard_projects,
-                    'other_projects': other_projects,
-                    'other_total_size': other_total_size
+            # 使用线程池并发扫描，最大线程数设为 16 (适合 I/O 密集型任务)
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                # 提交所有任务
+                future_to_eng = {
+                    executor.submit(self.process_single_engineer, base_dir, eng, threshold_bytes, cutoff_date, nasuni_pattern): eng 
+                    for eng in engineers
                 }
 
-            self.root.after(0, self.render_engineer_cards, filtered_count)
+                # 任务完成时收集结果
+                for future in as_completed(future_to_eng):
+                    eng_name = future_to_eng[future]
+                    try:
+                        name, result_data, local_filtered = future.result()
+                        if result_data is not None:
+                            self.data[name] = result_data
+                            total_filtered_count += local_filtered
+                    except Exception as exc:
+                        print(f"{eng_name} 扫描出错: {exc}")
+                    
+                    completed_engineers += 1
+                    # 实时更新 UI 进度
+                    self.root.after(0, self.update_progress_ui, completed_engineers, total_engineers, eng_name)
+
+            # 所有线程扫描完毕，渲染卡片
+            self.root.after(0, self.render_engineer_cards, total_filtered_count)
             
         except Exception as e:
             self.root.after(0, lambda err=e: messagebox.showerror("严重错误", f"扫描过程中出现异常: {str(err)}"))
             self.root.after(0, self.reset_ui_state)
+
+    def update_progress_ui(self, current, total, last_completed):
+        """实时更新状态栏进度"""
+        self.status_var.set(f"正在扫描: {current} / {total} (刚刚完成: {last_completed})")
 
     def reset_ui_state(self):
         self.scan_btn.config(state=tk.NORMAL)
