@@ -42,10 +42,25 @@ def get_creation_time(path):
     except AttributeError:
         return stat.st_ctime
 
+def get_age_status_and_tag(creation_date, now):
+    """根据创建时间计算档次、颜色标签和 Emoji"""
+    days_diff = (now - creation_date).days
+
+    if days_diff <= 14:
+        return "🟢 <= 14 Days", "color_green"
+    elif days_diff <= 30:
+        return "🟢 15-30 Days", "color_green"
+    elif days_diff <= 90:
+        return "🟡 31-90 Days", "color_yellow"
+    elif days_diff <= 180:
+        return "🔴 91-180 Days", "color_red"
+    else:
+        return "🔴 > 180 Days", "color_red"
+
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具")
+        self.root.title("CT 数据容量统计工具 (极速多线程版)")
         self.root.geometry("950x650")
         self.root.configure(bg="#f0f0f0")
         
@@ -132,7 +147,7 @@ class CTDataApp:
 
         threading.Thread(target=self.scan_manager, args=(base_dir, threshold_bytes), daemon=True).start()
 
-    def process_single_engineer(self, base_dir, engineer_name, threshold_bytes, cutoff_date, nasuni_pattern):
+    def process_single_engineer(self, base_dir, engineer_name, threshold_bytes, now_time, nasuni_pattern):
         eng_path = os.path.join(base_dir, engineer_name)
         
         eng_total_size = 0
@@ -166,7 +181,7 @@ class CTDataApp:
                 eng_total_size += file_size
                 other_projects.append({
                     'name': f"📄 [文件] {project_name}",
-                    'age': "-", 'date': "-", 
+                    'age': "-", 'date': "-", 'tag': "",
                     'size': file_size, 'size_str': format_size(file_size)
                 })
                 continue
@@ -181,13 +196,16 @@ class CTDataApp:
 
             ctime = get_creation_time(proj_path)
             creation_date = datetime.fromtimestamp(ctime)
-            age_status = "> 90 Days" if creation_date < cutoff_date else "<= 90 Days"
+            
+            # 获取细化的时间标签和颜色标识
+            age_status, color_tag = get_age_status_and_tag(creation_date, now_time)
 
             if nasuni_pattern.search(project_name):
                 nasuni_total_size += proj_size
                 nasuni_projects.append({
                     'name': project_name,
                     'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
+                    'tag': color_tag,
                     'size': proj_size, 'size_str': format_size(proj_size)
                 })
             elif "FACT" in project_name:
@@ -195,13 +213,14 @@ class CTDataApp:
                 waiting_projects.append({
                     'name': project_name,
                     'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
+                    'tag': color_tag,
                     'size': proj_size, 'size_str': format_size(proj_size)
                 })
             else:
                 other_total_size += proj_size
                 other_projects.append({
                     'name': f"📁 {project_name}",
-                    'age': "-", 'date': "-", 
+                    'age': "-", 'date': "-", 'tag': "",
                     'size': proj_size, 'size_str': format_size(proj_size)
                 })
 
@@ -220,7 +239,7 @@ class CTDataApp:
 
     def scan_manager(self, base_dir, threshold_bytes):
         nasuni_pattern = re.compile(r'[Nn][-_\s]?FACT')
-        cutoff_date = datetime.now() - timedelta(days=90)
+        now_time = datetime.now()
 
         self.data = {}
         total_filtered_count = 0
@@ -236,7 +255,7 @@ class CTDataApp:
 
             with ThreadPoolExecutor(max_workers=16) as executor:
                 future_to_eng = {
-                    executor.submit(self.process_single_engineer, base_dir, eng, threshold_bytes, cutoff_date, nasuni_pattern): eng 
+                    executor.submit(self.process_single_engineer, base_dir, eng, threshold_bytes, now_time, nasuni_pattern): eng 
                     for eng in engineers
                 }
 
@@ -317,23 +336,25 @@ class CTDataApp:
         tk.Label(summary_frame, text=f"工程师: {engineer_name}", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
         tk.Label(summary_frame, text=f"总占用: {info['total_size_str']}", font=("Arial", 12), fg="#0066cc").pack(side=tk.RIGHT)
 
-        # 移除了 "Category" 列
         columns = ("Age", "Date", "Size")
         tree = ttk.Treeview(detail_win, columns=columns)
         
-        # 将腾出的空间分配给文件名列
         tree.heading("#0", text="工程文件夹 / 文件名")
-        tree.column("#0", width=450, anchor="w")
+        tree.column("#0", width=420, anchor="w")
 
         tree.heading("Age", text="时间标记")
         tree.heading("Date", text="创建日期")
         tree.heading("Size", text="大小")
 
-        tree.column("Age", width=100)
+        tree.column("Age", width=130)
         tree.column("Date", width=100)
         tree.column("Size", width=100, anchor="e")
 
+        # 配置颜色标签 (改变整行文字颜色)
         tree.tag_configure('group_node', font=('Arial', 10, 'bold'), background='#f5f5f5')
+        tree.tag_configure('color_green', foreground='#008000') # 绿色
+        tree.tag_configure('color_yellow', foreground='#cc8800') # 暗黄色 (适应白色背景)
+        tree.tag_configure('color_red', foreground='#cc0000') # 红色
 
         # 1. 插入 Waiting to Upload 类别
         if info['waiting_projects']:
@@ -344,9 +365,10 @@ class CTDataApp:
             
             sorted_waiting = sorted(info['waiting_projects'], key=lambda x: x['size'], reverse=True)
             for proj in sorted_waiting:
+                tags = (proj['tag'],) if proj['tag'] else ()
                 tree.insert(waiting_node, tk.END, text=f"📁 {proj['name']}", values=(
                     proj['age'], proj['date'], proj['size_str']
-                ))
+                ), tags=tags)
 
         # 2. 插入 Nasuni Uploaded 类别
         if info['nasuni_projects']:
@@ -357,9 +379,10 @@ class CTDataApp:
             
             sorted_nasuni = sorted(info['nasuni_projects'], key=lambda x: x['size'], reverse=True)
             for proj in sorted_nasuni:
+                tags = (proj['tag'],) if proj['tag'] else ()
                 tree.insert(nasuni_node, tk.END, text=f"📁 {proj['name']}", values=(
                     proj['age'], proj['date'], proj['size_str']
-                ))
+                ), tags=tags)
 
         # 3. 插入 Others 类别
         if info['other_projects']:
