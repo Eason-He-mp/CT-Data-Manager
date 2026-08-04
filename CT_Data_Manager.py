@@ -5,6 +5,8 @@ from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import platform
+import subprocess
 
 def get_dir_size(start_path):
     """使用 os.scandir 替代 os.walk，大幅加速目录遍历和大小计算"""
@@ -53,14 +55,14 @@ def get_age_status_and_tag(creation_date, now):
     elif days_diff <= 90:
         return "🟡 31-90 Days", "color_yellow"
     elif days_diff <= 180:
-        return "🔴 91-180 Days", "color_red"
+        return "🟣 91-180 Days", "color_purple"
     else:
         return "🔴 > 180 Days", "color_red"
 
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具 (极速多线程版)")
+        self.root.title("CT 数据容量统计工具 (智能穿透版)")
         self.root.geometry("950x650")
         self.root.configure(bg="#f0f0f0")
         
@@ -151,16 +153,12 @@ class CTDataApp:
         eng_path = os.path.join(base_dir, engineer_name)
         
         eng_total_size = 0
-        
         waiting_projects = []
         waiting_total_size = 0
-        
         nasuni_projects = []
         nasuni_total_size = 0
-        
         other_projects = []
         other_total_size = 0
-        
         local_filtered_count = 0
 
         try:
@@ -168,61 +166,97 @@ class CTDataApp:
         except PermissionError:
             return engineer_name, None, 0 
 
-        for project_name in items_in_eng_dir:
-            proj_path = os.path.join(eng_path, project_name)
+        for item in items_in_eng_dir:
+            item_path = os.path.join(eng_path, item)
             
-            if not os.path.isdir(proj_path):
+            # 1. 第一层：如果是文件，放入 Others
+            if os.path.isfile(item_path):
                 try:
-                    file_size = os.path.getsize(proj_path)
+                    file_size = os.path.getsize(item_path)
                 except OSError:
                     file_size = 0
                     
                 other_total_size += file_size
                 eng_total_size += file_size
                 other_projects.append({
-                    'name': f"📄 [文件] {project_name}",
+                    'name': f"📄 {item}", 'path': item_path,
                     'age': "-", 'date': "-", 'tag': "",
                     'size': file_size, 'size_str': format_size(file_size)
                 })
                 continue
 
-            proj_size = get_dir_size(proj_path)
+            # 2. 第一层：如果是文件夹
+            if os.path.isdir(item_path):
+                # 2.1 如果是 FACT 工程文件夹
+                if nasuni_pattern.search(item) or "FACT" in item:
+                    proj_size = get_dir_size(item_path)
+                    if threshold_bytes > 0 and proj_size < threshold_bytes:
+                        local_filtered_count += 1
+                        continue
 
-            if threshold_bytes > 0 and proj_size < threshold_bytes:
-                local_filtered_count += 1
-                continue
+                    eng_total_size += proj_size
+                    ctime = get_creation_time(item_path)
+                    creation_date = datetime.fromtimestamp(ctime)
+                    age_status, color_tag = get_age_status_and_tag(creation_date, now_time)
 
-            eng_total_size += proj_size
+                    proj_info = {
+                        'name': item, 'path': item_path,
+                        'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
+                        'tag': color_tag, 'size': proj_size, 'size_str': format_size(proj_size)
+                    }
 
-            ctime = get_creation_time(proj_path)
-            creation_date = datetime.fromtimestamp(ctime)
-            
-            # 获取细化的时间标签和颜色标识
-            age_status, color_tag = get_age_status_and_tag(creation_date, now_time)
+                    if nasuni_pattern.search(item):
+                        nasuni_total_size += proj_size
+                        nasuni_projects.append(proj_info)
+                    else:
+                        waiting_total_size += proj_size
+                        waiting_projects.append(proj_info)
 
-            if nasuni_pattern.search(project_name):
-                nasuni_total_size += proj_size
-                nasuni_projects.append({
-                    'name': project_name,
-                    'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
-                    'tag': color_tag,
-                    'size': proj_size, 'size_str': format_size(proj_size)
-                })
-            elif "FACT" in project_name:
-                waiting_total_size += proj_size
-                waiting_projects.append({
-                    'name': project_name,
-                    'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
-                    'tag': color_tag,
-                    'size': proj_size, 'size_str': format_size(proj_size)
-                })
-            else:
-                other_total_size += proj_size
-                other_projects.append({
-                    'name': f"📁 {project_name}",
-                    'age': "-", 'date': "-", 'tag': "",
-                    'size': proj_size, 'size_str': format_size(proj_size)
-                })
+                # 2.2 如果是不包含 FACT 的文件夹（即需求方嵌套目录）
+                else:
+                    try:
+                        sub_items = os.listdir(item_path)
+                    except PermissionError:
+                        continue
+
+                    for sub_item in sub_items:
+                        sub_path = os.path.join(item_path, sub_item)
+                        
+                        # 2.2.1 第二层：如果是文件夹，无条件默认为 FACT 工程
+                        if os.path.isdir(sub_path):
+                            proj_size = get_dir_size(sub_path)
+                            if threshold_bytes > 0 and proj_size < threshold_bytes:
+                                local_filtered_count += 1
+                                continue
+                                
+                            eng_total_size += proj_size
+                            ctime = get_creation_time(sub_path)
+                            creation_date = datetime.fromtimestamp(ctime)
+                            age_status, color_tag = get_age_status_and_tag(creation_date, now_time)
+
+                            # UI显示名称：需求方 / 工程名
+                            display_name = f"{item} / {sub_item}"
+                            proj_info = {
+                                'name': display_name, 'path': sub_path,
+                                'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
+                                'tag': color_tag, 'size': proj_size, 'size_str': format_size(proj_size)
+                            }
+
+                            if nasuni_pattern.search(sub_item):
+                                nasuni_total_size += proj_size
+                                nasuni_projects.append(proj_info)
+                            else:
+                                waiting_total_size += proj_size
+                                waiting_projects.append(proj_info)
+                        
+                        # 2.2.2 第二层：如果是文件，静默统计大小，不显示在列表中
+                        elif os.path.isfile(sub_path):
+                            try:
+                                file_size = os.path.getsize(sub_path)
+                            except OSError:
+                                file_size = 0
+                            eng_total_size += file_size
+                            other_total_size += file_size
 
         result_data = {
             'total_size': eng_total_size,
@@ -328,7 +362,7 @@ class CTDataApp:
         info = self.data[engineer_name]
         
         detail_win = tk.Toplevel(self.root)
-        detail_win.title(f"{engineer_name} 的详细数据")
+        detail_win.title(f"{engineer_name} 的详细数据 (双击条目可打开文件夹)")
         detail_win.geometry("850x450")
         
         summary_frame = tk.Frame(detail_win, pady=10, padx=10)
@@ -339,7 +373,7 @@ class CTDataApp:
         columns = ("Age", "Date", "Size")
         tree = ttk.Treeview(detail_win, columns=columns)
         
-        tree.heading("#0", text="工程文件夹 / 文件名")
+        tree.heading("#0", text="工程文件夹 / 文件名 (双击打开)")
         tree.column("#0", width=420, anchor="w")
 
         tree.heading("Age", text="时间标记")
@@ -350,11 +384,14 @@ class CTDataApp:
         tree.column("Date", width=100)
         tree.column("Size", width=100, anchor="e")
 
-        # 配置颜色标签 (改变整行文字颜色)
         tree.tag_configure('group_node', font=('Arial', 10, 'bold'), background='#f5f5f5')
-        tree.tag_configure('color_green', foreground='#008000') # 绿色
-        tree.tag_configure('color_yellow', foreground='#cc8800') # 暗黄色 (适应白色背景)
-        tree.tag_configure('color_red', foreground='#cc0000') # 红色
+        tree.tag_configure('color_green', foreground='#008000') 
+        tree.tag_configure('color_yellow', foreground='#cc8800') 
+        tree.tag_configure('color_purple', foreground='#800080') 
+        tree.tag_configure('color_red', foreground='#cc0000') 
+
+        # 字典用于存储 Treeview 节点 ID 到本地路径的映射
+        node_paths = {}
 
         # 1. 插入 Waiting to Upload 类别
         if info['waiting_projects']:
@@ -366,9 +403,10 @@ class CTDataApp:
             sorted_waiting = sorted(info['waiting_projects'], key=lambda x: x['size'], reverse=True)
             for proj in sorted_waiting:
                 tags = (proj['tag'],) if proj['tag'] else ()
-                tree.insert(waiting_node, tk.END, text=f"📁 {proj['name']}", values=(
+                iid = tree.insert(waiting_node, tk.END, text=f"📁 {proj['name']}", values=(
                     proj['age'], proj['date'], proj['size_str']
                 ), tags=tags)
+                node_paths[iid] = proj['path']
 
         # 2. 插入 Nasuni Uploaded 类别
         if info['nasuni_projects']:
@@ -380,9 +418,10 @@ class CTDataApp:
             sorted_nasuni = sorted(info['nasuni_projects'], key=lambda x: x['size'], reverse=True)
             for proj in sorted_nasuni:
                 tags = (proj['tag'],) if proj['tag'] else ()
-                tree.insert(nasuni_node, tk.END, text=f"📁 {proj['name']}", values=(
+                iid = tree.insert(nasuni_node, tk.END, text=f"📁 {proj['name']}", values=(
                     proj['age'], proj['date'], proj['size_str']
                 ), tags=tags)
+                node_paths[iid] = proj['path']
 
         # 3. 插入 Others 类别
         if info['other_projects']:
@@ -393,15 +432,43 @@ class CTDataApp:
 
             sorted_others = sorted(info['other_projects'], key=lambda x: x['size'], reverse=True)
             for proj in sorted_others:
-                tree.insert(other_node, tk.END, text=proj['name'], values=(
+                iid = tree.insert(other_node, tk.END, text=proj['name'], values=(
                     "", "", proj['size_str']
                 ))
+                node_paths[iid] = proj['path']
 
         scrollbar = ttk.Scrollbar(detail_win, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=(0, 10))
+
+        # --- 新增：双击打开文件夹功能 ---
+        def on_double_click(event):
+            selected = tree.selection()
+            if not selected:
+                return
+            item_id = selected[0]
+            
+            # 如果点击的是具体的工程（存在于映射字典中）
+            if item_id in node_paths:
+                path_to_open = node_paths[item_id]
+                if os.path.exists(path_to_open):
+                    try:
+                        # 兼容跨平台打开文件夹
+                        if platform.system() == "Windows":
+                            os.startfile(path_to_open)
+                        elif platform.system() == "Darwin":
+                            subprocess.Popen(["open", path_to_open])
+                        else:
+                            subprocess.Popen(["xdg-open", path_to_open])
+                    except Exception as e:
+                        messagebox.showerror("打开失败", f"无法打开路径:\n{path_to_open}\n\n错误信息: {e}")
+                else:
+                    messagebox.showwarning("路径不存在", "该文件或文件夹可能已被移动或删除。")
+
+        # 绑定鼠标双击左键事件
+        tree.bind("<Double-1>", on_double_click)
 
 if __name__ == "__main__":
     root = tk.Tk()
