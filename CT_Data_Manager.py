@@ -3,7 +3,7 @@ import re
 import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog
-import tkinter.messagebox as messagebox  # 修复：显式导入 messagebox
+import tkinter.messagebox as messagebox
 from datetime import datetime, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -332,6 +332,7 @@ class CTDataApp:
         threading.Thread(target=self.tif_scan_process, daemon=True).start()
 
     def get_tif_size_in_dir(self, start_path):
+        """递归计算文件夹中 TIF 文件的大小，排除包含 bright 或 dark 的文件"""
         tif_size = 0
         dirs_to_process = [start_path]
         while dirs_to_process:
@@ -341,8 +342,12 @@ class CTDataApp:
                     for entry in it:
                         if entry.is_symlink():
                             continue
-                        if entry.is_file() and entry.name.lower().endswith(('.tif', '.tiff')):
-                            tif_size += entry.stat(follow_symlinks=False).st_size
+                        if entry.is_file():
+                            filename_lower = entry.name.lower()
+                            # 检查是否为 TIF 且不包含 bright/dark
+                            if filename_lower.endswith(('.tif', '.tiff')) and \
+                               "bright" not in filename_lower and "dark" not in filename_lower:
+                                tif_size += entry.stat(follow_symlinks=False).st_size
                         elif entry.is_dir():
                             dirs_to_process.append(entry.path)
             except OSError:
@@ -566,15 +571,18 @@ class CTDataApp:
                 context_menu.add_command(label="❌ 删除整个文件夹", command=delete_folder)
                 
                 def delete_tifs():
-                    if messagebox.askyesno("确认删除", f"⚠️ 请确认删除此文件夹中的所有 TIF 文件：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
+                    if messagebox.askyesno("确认删除", f"⚠️ 请确认删除此文件夹中的所有 TIF 文件\n(将自动保留包含 bright 和 dark 的校准文件)：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
                         try:
                             deleted_count = 0
                             for root_dir, _, files in os.walk(proj['path']):
                                 for file in files:
-                                    if file.lower().endswith(('.tif', '.tiff')):
+                                    filename_lower = file.lower()
+                                    # 删除规则：是 TIF 且不包含 bright/dark
+                                    if filename_lower.endswith(('.tif', '.tiff')) and \
+                                       "bright" not in filename_lower and "dark" not in filename_lower:
                                         os.remove(os.path.join(root_dir, file))
                                         deleted_count += 1
-                            messagebox.showinfo("清理完成", f"成功删除了 {deleted_count} 个 TIF 文件。")
+                            messagebox.showinfo("清理完成", f"成功删除了 {deleted_count} 个 TIF 文件。\n(已保留校准文件)")
                             self.refresh_single_engineer(engineer_name, detail_win)
                         except Exception as e:
                             messagebox.showerror("删除失败", f"删除 TIF 时发生错误:\n{e}")
