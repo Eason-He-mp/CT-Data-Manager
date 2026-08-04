@@ -222,7 +222,7 @@ class CTDataApp:
                     for sub_item in sub_items:
                         sub_path = os.path.join(item_path, sub_item)
                         
-                        # 2.2.1 第二层：如果是文件夹，无条件默认为 FACT 工程
+                        # 2.2.1 第二层：如果是文件夹
                         if os.path.isdir(sub_path):
                             proj_size = get_dir_size(sub_path)
                             if threshold_bytes > 0 and proj_size < threshold_bytes:
@@ -232,22 +232,32 @@ class CTDataApp:
                             eng_total_size += proj_size
                             ctime = get_creation_time(sub_path)
                             creation_date = datetime.fromtimestamp(ctime)
-                            age_status, color_tag = get_age_status_and_tag(creation_date, now_time)
-
-                            # UI显示名称：需求方 / 工程名
+                            
                             display_name = f"{item} / {sub_item}"
-                            proj_info = {
-                                'name': display_name, 'path': sub_path,
-                                'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
-                                'tag': color_tag, 'size': proj_size, 'size_str': format_size(proj_size)
-                            }
 
-                            if nasuni_pattern.search(sub_item):
-                                nasuni_total_size += proj_size
-                                nasuni_projects.append(proj_info)
+                            # 【逻辑修改处】检查子文件夹是否包含 FACT
+                            if nasuni_pattern.search(sub_item) or "FACT" in sub_item:
+                                age_status, color_tag = get_age_status_and_tag(creation_date, now_time)
+                                proj_info = {
+                                    'name': display_name, 'path': sub_path,
+                                    'age': age_status, 'date': creation_date.strftime('%Y-%m-%d'),
+                                    'tag': color_tag, 'size': proj_size, 'size_str': format_size(proj_size)
+                                }
+
+                                if nasuni_pattern.search(sub_item):
+                                    nasuni_total_size += proj_size
+                                    nasuni_projects.append(proj_info)
+                                else:
+                                    waiting_total_size += proj_size
+                                    waiting_projects.append(proj_info)
+                            # 如果子文件夹不包含 FACT，整体放入 Others
                             else:
-                                waiting_total_size += proj_size
-                                waiting_projects.append(proj_info)
+                                other_total_size += proj_size
+                                other_projects.append({
+                                    'name': f"📁 {display_name}", 'path': sub_path,
+                                    'age': "-", 'date': "-", 'tag': "",
+                                    'size': proj_size, 'size_str': format_size(proj_size)
+                                })
                         
                         # 2.2.2 第二层：如果是文件，静默统计大小，不显示在列表中
                         elif os.path.isfile(sub_path):
@@ -390,7 +400,6 @@ class CTDataApp:
         tree.tag_configure('color_purple', foreground='#800080') 
         tree.tag_configure('color_red', foreground='#cc0000') 
 
-        # 字典用于存储 Treeview 节点 ID 到本地路径的映射
         node_paths = {}
 
         # 1. 插入 Waiting to Upload 类别
@@ -443,19 +452,16 @@ class CTDataApp:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=(0, 10))
 
-        # --- 新增：双击打开文件夹功能 ---
         def on_double_click(event):
             selected = tree.selection()
             if not selected:
                 return
             item_id = selected[0]
             
-            # 如果点击的是具体的工程（存在于映射字典中）
             if item_id in node_paths:
                 path_to_open = node_paths[item_id]
                 if os.path.exists(path_to_open):
                     try:
-                        # 兼容跨平台打开文件夹
                         if platform.system() == "Windows":
                             os.startfile(path_to_open)
                         elif platform.system() == "Darwin":
@@ -467,7 +473,6 @@ class CTDataApp:
                 else:
                     messagebox.showwarning("路径不存在", "该文件或文件夹可能已被移动或删除。")
 
-        # 绑定鼠标双击左键事件
         tree.bind("<Double-1>", on_double_click)
 
 if __name__ == "__main__":
