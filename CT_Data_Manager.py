@@ -20,6 +20,7 @@ def center_window(window, width, height):
     window.geometry(f'{width}x{height}+{x}+{y}')
 
 def get_dir_size(start_path):
+    """使用 os.scandir 替代 os.walk，大幅加速目录遍历和大小计算"""
     total_size = 0
     dirs_to_process = [start_path]
     while dirs_to_process:
@@ -38,6 +39,7 @@ def get_dir_size(start_path):
     return total_size
 
 def format_size(size_in_bytes):
+    """将字节转换为人类可读的格式"""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size_in_bytes < 1024.0:
             return f"{size_in_bytes:.2f} {unit}"
@@ -45,6 +47,7 @@ def format_size(size_in_bytes):
     return f"{size_in_bytes:.2f} PB"
 
 def get_creation_time(path):
+    """获取创建时间"""
     stat = os.stat(path)
     try:
         return stat.st_birthtime
@@ -52,6 +55,7 @@ def get_creation_time(path):
         return stat.st_ctime
 
 def get_age_status_and_tag(creation_date, now):
+    """根据创建时间计算档次、颜色标签和 Emoji"""
     days_diff = (now - creation_date).days
     if days_diff <= 14:
         return "🟢 <= 14 Days", "color_green"
@@ -67,10 +71,10 @@ def get_age_status_and_tag(creation_date, now):
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具")
+        self.root.title("CT 数据容量统计工具 (智能穿透 & 极速清理版)")
         self.root.configure(bg="#f0f0f0")
         
-        # 主窗口居中显示
+        # 主窗口居中
         center_window(self.root, 1000, 650)
         
         self.data = {} 
@@ -452,18 +456,37 @@ class CTDataApp:
         
         return prog_win
 
-    def refresh_single_engineer(self, eng_name, callback=None):
+    def refresh_single_engineer(self, eng_name, cleared_proj_path=None, callback=None):
         nasuni_pattern = re.compile(r'[Nn][-_\s]?FACT')
         now_time = datetime.now()
         
         self.status_var.set(f"正在更新 {eng_name} 的数据...")
         self.root.update()
 
+        old_tif_cache = {}
+        if self.tif_scanned and eng_name in self.data:
+            old_info = self.data[eng_name]
+            for category in ['waiting_projects', 'nasuni_projects', 'other_projects']:
+                for proj in old_info[category]:
+                    if 'tif_size' in proj:
+                        old_tif_cache[proj['path']] = proj['tif_size']
+
         _, result_data, _ = self.process_single_engineer(
             self.last_base_dir, eng_name, self.last_threshold_bytes, now_time, nasuni_pattern
         )
 
         if result_data:
+            if self.tif_scanned:
+                for category in ['waiting_projects', 'nasuni_projects', 'other_projects']:
+                    for proj in result_data[category]:
+                        path = proj['path']
+                        if cleared_proj_path and path == cleared_proj_path:
+                            proj['tif_size'] = 0
+                        elif path in old_tif_cache:
+                            proj['tif_size'] = old_tif_cache[path]
+                        else:
+                            proj['tif_size'] = 0
+
             self.data[eng_name] = result_data
         else:
             if eng_name in self.data:
@@ -481,7 +504,6 @@ class CTDataApp:
         detail_win = tk.Toplevel(self.root)
         detail_win.title(f"{engineer_name} 的详细数据 (双击打开，右键菜单)")
         
-        # 详情页居中显示
         center_window(detail_win, 850, 450)
         
         summary_frame = tk.Frame(detail_win, pady=10, padx=10)
@@ -562,7 +584,6 @@ class CTDataApp:
                 ), tags=('group_node',))
                 insert_projects(other_node, info['other_projects'])
 
-            # 刷新完成后，将详情页置顶并获取焦点
             detail_win.lift()
             detail_win.focus_force()
 
@@ -608,22 +629,23 @@ class CTDataApp:
                 
                 def execute_delete_folder(prog_win):
                     try:
+                        # 恢复使用 Python 原生永久删除
                         if proj.get('is_dir', True):
                             shutil.rmtree(proj['path'])
                         else:
                             os.remove(proj['path'])
                         self.root.after(0, lambda: prog_win.destroy())
-                        self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, populate_treeview))
+                        self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, None, populate_treeview))
                     except Exception as e:
                         self.root.after(0, lambda: prog_win.destroy())
                         self.root.after(0, lambda err=e: messagebox.showerror("删除失败", f"删除时发生错误:\n{err}"))
 
                 def delete_folder():
-                    if messagebox.askyesno("确认删除", f"⚠️ 警告！\n请确认删除文件夹：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
-                        prog_win = self.show_progress_dialog("正在删除", "正在删除数据，请耐心等待...")
+                    if messagebox.askyesno("确认删除", f"⚠️ 警告！\n请确认永久删除文件夹：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
+                        prog_win = self.show_progress_dialog("正在删除", "正在执行永久删除，请耐心等待...")
                         threading.Thread(target=execute_delete_folder, args=(prog_win,), daemon=True).start()
                             
-                context_menu.add_command(label="❌ 删除整个文件夹", command=delete_folder)
+                context_menu.add_command(label="❌ 永久删除整个文件夹", command=delete_folder)
                 
                 def execute_delete_tifs(prog_win):
                     try:
@@ -633,23 +655,24 @@ class CTDataApp:
                                 filename_lower = file.lower()
                                 if filename_lower.endswith(('.tif', '.tiff')) and \
                                    "bright" not in filename_lower and "dark" not in filename_lower:
+                                    # 恢复使用 Python 原生永久删除
                                     os.remove(os.path.join(root_dir, file))
                                     deleted_count += 1
                         
                         self.root.after(0, lambda: prog_win.destroy())
-                        self.root.after(0, lambda c=deleted_count: messagebox.showinfo("清理完成", f"成功删除了 {c} 个 TIF 文件。\n(已保留校准文件)"))
-                        self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, populate_treeview))
+                        self.root.after(0, lambda c=deleted_count: messagebox.showinfo("清理完成", f"成功永久删除了 {c} 个 TIF 文件。\n(已保留校准文件)"))
+                        self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, proj['path'], populate_treeview))
                     except Exception as e:
                         self.root.after(0, lambda: prog_win.destroy())
                         self.root.after(0, lambda err=e: messagebox.showerror("删除失败", f"删除 TIF 时发生错误:\n{err}"))
 
                 def delete_tifs():
-                    if messagebox.askyesno("确认删除", f"⚠️ 请确认删除此文件夹中的所有 TIF 文件\n(将自动保留包含 bright 和 dark 的校准文件)：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
-                        prog_win = self.show_progress_dialog("正在清理 TIF", "正在遍历并删除 TIF 文件，请耐心等待...")
+                    if messagebox.askyesno("确认删除", f"⚠️ 请确认永久删除此文件夹中的所有 TIF 文件\n(将自动保留包含 bright 和 dark 的校准文件)：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
+                        prog_win = self.show_progress_dialog("正在清理 TIF", "正在遍历并永久删除 TIF 文件，请耐心等待...")
                         threading.Thread(target=execute_delete_tifs, args=(prog_win,), daemon=True).start()
 
                 state = tk.NORMAL if (self.tif_scanned and proj.get('is_dir', True)) else tk.DISABLED
-                context_menu.add_command(label="🗑️ 删除此文件夹里的 TIF", command=delete_tifs, state=state)
+                context_menu.add_command(label="🗑️ 永久删除此文件夹里的 TIF", command=delete_tifs, state=state)
 
                 context_menu.post(event.x_root, event.y_root)
 
