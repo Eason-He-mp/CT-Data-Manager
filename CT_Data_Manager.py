@@ -71,7 +71,7 @@ def get_age_status_and_tag(creation_date, now):
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具 (智能穿透 & 极速清理版)")
+        self.root.title("CT 数据容量统计工具")
         self.root.configure(bg="#f0f0f0")
         
         # 主窗口居中
@@ -346,8 +346,10 @@ class CTDataApp:
         self.status_var.set("正在扫描大于 50GB 的工程寻找 TIF 文件，请稍候...")
         threading.Thread(target=self.tif_scan_process, daemon=True).start()
 
-    def get_tif_size_in_dir(self, start_path):
+    def get_tif_info_in_dir(self, start_path):
+        """递归计算文件夹中 TIF 文件的大小和数量，排除 bright/dark"""
         tif_size = 0
+        tif_count = 0
         dirs_to_process = [start_path]
         while dirs_to_process:
             current_dir = dirs_to_process.pop()
@@ -361,11 +363,12 @@ class CTDataApp:
                             if filename_lower.endswith(('.tif', '.tiff')) and \
                                "bright" not in filename_lower and "dark" not in filename_lower:
                                 tif_size += entry.stat(follow_symlinks=False).st_size
+                                tif_count += 1
                         elif entry.is_dir():
                             dirs_to_process.append(entry.path)
             except OSError:
                 pass
-        return tif_size
+        return tif_size, tif_count
 
     def tif_scan_process(self):
         threshold_50gb = 50 * 1024 * 1024 * 1024
@@ -374,9 +377,12 @@ class CTDataApp:
             for category in ['waiting_projects', 'nasuni_projects', 'other_projects']:
                 for proj in info[category]:
                     if proj.get('is_dir', False) and proj['size'] >= threshold_50gb:
-                        proj['tif_size'] = self.get_tif_size_in_dir(proj['path'])
+                        t_size, t_count = self.get_tif_info_in_dir(proj['path'])
+                        proj['tif_size'] = t_size
+                        proj['tif_count'] = t_count
                     else:
                         proj['tif_size'] = 0
+                        proj['tif_count'] = 0
 
         self.tif_scanned = True
         self.root.after(0, self.on_tif_scan_complete)
@@ -441,20 +447,23 @@ class CTDataApp:
                 col = 0
                 row += 1
 
-    def show_progress_dialog(self, title, message):
+    def show_progress_dialog(self, title, message, mode="indeterminate", maximum=100):
         prog_win = tk.Toplevel(self.root)
         prog_win.title(title)
         center_window(prog_win, 350, 120)
         prog_win.transient(self.root) 
         prog_win.grab_set() 
 
-        tk.Label(prog_win, text=message, font=("Arial", 10), pady=15).pack()
+        msg_label = tk.Label(prog_win, text=message, font=("Arial", 10), pady=15)
+        msg_label.pack()
         
-        progress = ttk.Progressbar(prog_win, orient="horizontal", length=280, mode="indeterminate")
+        progress = ttk.Progressbar(prog_win, orient="horizontal", length=280, mode=mode, maximum=maximum)
         progress.pack(pady=10)
-        progress.start(15) 
         
-        return prog_win
+        if mode == "indeterminate":
+            progress.start(15) 
+            
+        return prog_win, progress, msg_label
 
     def refresh_single_engineer(self, eng_name, cleared_proj_path=None, callback=None):
         nasuni_pattern = re.compile(r'[Nn][-_\s]?FACT')
@@ -469,7 +478,7 @@ class CTDataApp:
             for category in ['waiting_projects', 'nasuni_projects', 'other_projects']:
                 for proj in old_info[category]:
                     if 'tif_size' in proj:
-                        old_tif_cache[proj['path']] = proj['tif_size']
+                        old_tif_cache[proj['path']] = (proj['tif_size'], proj.get('tif_count', 0))
 
         _, result_data, _ = self.process_single_engineer(
             self.last_base_dir, eng_name, self.last_threshold_bytes, now_time, nasuni_pattern
@@ -482,10 +491,12 @@ class CTDataApp:
                         path = proj['path']
                         if cleared_proj_path and path == cleared_proj_path:
                             proj['tif_size'] = 0
+                            proj['tif_count'] = 0
                         elif path in old_tif_cache:
-                            proj['tif_size'] = old_tif_cache[path]
+                            proj['tif_size'], proj['tif_count'] = old_tif_cache[path]
                         else:
                             proj['tif_size'] = 0
+                            proj['tif_count'] = 0
 
             self.data[eng_name] = result_data
         else:
@@ -628,48 +639,96 @@ class CTDataApp:
                 context_menu.add_separator()
                 
                 def execute_delete_folder(prog_win):
+                    error_files = [] 
+                    def on_rmtree_error(func, path, exc_info):
+                        error_files.append(f"{os.path.basename(path)}: {exc_info[1]}")
+
                     try:
-                        # 恢复使用 Python 原生永久删除
                         if proj.get('is_dir', True):
-                            shutil.rmtree(proj['path'])
+                            shutil.rmtree(proj['path'], onerror=on_rmtree_error)
                         else:
-                            os.remove(proj['path'])
+                            try:
+                                os.remove(proj['path'])
+                            except Exception as e:
+                                error_files.append(f"{os.path.basename(proj['path'])}: {e}")
+                        
                         self.root.after(0, lambda: prog_win.destroy())
+                        
+                        if error_files:
+                            error_msg = "\n".join(error_files[:5])
+                            if len(error_files) > 5:
+                                error_msg += f"\n... 以及其他 {len(error_files) - 5} 个文件"
+                            self.root.after(0, lambda: messagebox.showwarning(
+                                "部分删除失败", 
+                                f"文件夹已清理，但有 {len(error_files)} 个文件因权限或被占用无法删除：\n\n{error_msg}"
+                            ))
+                        
                         self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, None, populate_treeview))
                     except Exception as e:
                         self.root.after(0, lambda: prog_win.destroy())
-                        self.root.after(0, lambda err=e: messagebox.showerror("删除失败", f"删除时发生错误:\n{err}"))
+                        self.root.after(0, lambda err=e: messagebox.showerror("删除严重错误", f"发生了无法忽略的错误:\n{err}"))
 
                 def delete_folder():
                     if messagebox.askyesno("确认删除", f"⚠️ 警告！\n请确认永久删除文件夹：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
-                        prog_win = self.show_progress_dialog("正在删除", "正在执行永久删除，请耐心等待...")
+                        prog_win, _, _ = self.show_progress_dialog("正在删除", "正在执行永久删除，请耐心等待...", mode="indeterminate")
                         threading.Thread(target=execute_delete_folder, args=(prog_win,), daemon=True).start()
                             
                 context_menu.add_command(label="❌ 永久删除整个文件夹", command=delete_folder)
                 
-                def execute_delete_tifs(prog_win):
+                def execute_delete_tifs(prog_win, progress_bar, msg_label, total_count):
+                    deleted_count = 0
+                    error_files = []
                     try:
-                        deleted_count = 0
                         for root_dir, _, files in os.walk(proj['path']):
                             for file in files:
                                 filename_lower = file.lower()
                                 if filename_lower.endswith(('.tif', '.tiff')) and \
                                    "bright" not in filename_lower and "dark" not in filename_lower:
-                                    # 恢复使用 Python 原生永久删除
-                                    os.remove(os.path.join(root_dir, file))
-                                    deleted_count += 1
+                                    
+                                    file_path = os.path.join(root_dir, file)
+                                    try:
+                                        os.remove(file_path)
+                                        deleted_count += 1
+                                    except Exception as e:
+                                        error_files.append(f"{file}: {e}")
+                                    
+                                    processed = deleted_count + len(error_files)
+                                    if processed % 10 == 0 or processed == total_count:
+                                        self.root.after(0, lambda v=processed: progress_bar.config(value=v))
+                                        self.root.after(0, lambda v=processed: msg_label.config(text=f"正在处理: {v} / {total_count}"))
                         
                         self.root.after(0, lambda: prog_win.destroy())
-                        self.root.after(0, lambda c=deleted_count: messagebox.showinfo("清理完成", f"成功永久删除了 {c} 个 TIF 文件。\n(已保留校准文件)"))
+                        
+                        if error_files:
+                            error_msg = "\n".join(error_files[:5])
+                            if len(error_files) > 5:
+                                error_msg += f"\n... 以及其他 {len(error_files) - 5} 个文件"
+                            self.root.after(0, lambda c=deleted_count: messagebox.showwarning(
+                                "清理完成 (含警告)", 
+                                f"成功删除了 {c} 个 TIF 文件。\n但有 {len(error_files)} 个文件因权限或被占用无法删除：\n\n{error_msg}"
+                            ))
+                        else:
+                            self.root.after(0, lambda c=deleted_count: messagebox.showinfo("清理完成", f"成功永久删除了 {c} 个 TIF 文件。\n(已保留校准文件)"))
+                        
                         self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, proj['path'], populate_treeview))
                     except Exception as e:
                         self.root.after(0, lambda: prog_win.destroy())
-                        self.root.after(0, lambda err=e: messagebox.showerror("删除失败", f"删除 TIF 时发生错误:\n{err}"))
+                        self.root.after(0, lambda err=e: messagebox.showerror("遍历错误", f"遍历文件夹时发生错误:\n{err}"))
 
                 def delete_tifs():
                     if messagebox.askyesno("确认删除", f"⚠️ 请确认永久删除此文件夹中的所有 TIF 文件\n(将自动保留包含 bright 和 dark 的校准文件)：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
-                        prog_win = self.show_progress_dialog("正在清理 TIF", "正在遍历并永久删除 TIF 文件，请耐心等待...")
-                        threading.Thread(target=execute_delete_tifs, args=(prog_win,), daemon=True).start()
+                        total_tifs = proj.get('tif_count', 0)
+                        if total_tifs == 0:
+                            messagebox.showinfo("提示", "该文件夹中没有符合条件的 TIF 文件。")
+                            return
+
+                        prog_win, progress_bar, msg_label = self.show_progress_dialog(
+                            "正在清理 TIF", 
+                            f"准备删除 {total_tifs} 个文件...", 
+                            mode="determinate", 
+                            maximum=total_tifs
+                        )
+                        threading.Thread(target=execute_delete_tifs, args=(prog_win, progress_bar, msg_label, total_tifs), daemon=True).start()
 
                 state = tk.NORMAL if (self.tif_scanned and proj.get('is_dir', True)) else tk.DISABLED
                 context_menu.add_command(label="🗑️ 永久删除此文件夹里的 TIF", command=delete_tifs, state=state)
