@@ -332,7 +332,6 @@ class CTDataApp:
         threading.Thread(target=self.tif_scan_process, daemon=True).start()
 
     def get_tif_size_in_dir(self, start_path):
-        """递归计算文件夹中 TIF 文件的大小，排除包含 bright 或 dark 的文件"""
         tif_size = 0
         dirs_to_process = [start_path]
         while dirs_to_process:
@@ -344,7 +343,6 @@ class CTDataApp:
                             continue
                         if entry.is_file():
                             filename_lower = entry.name.lower()
-                            # 检查是否为 TIF 且不包含 bright/dark
                             if filename_lower.endswith(('.tif', '.tiff')) and \
                                "bright" not in filename_lower and "dark" not in filename_lower:
                                 tif_size += entry.stat(follow_symlinks=False).st_size
@@ -428,7 +426,28 @@ class CTDataApp:
                 col = 0
                 row += 1
 
-    def refresh_single_engineer(self, eng_name, detail_win):
+    def show_progress_dialog(self, title, message):
+        prog_win = tk.Toplevel(self.root)
+        prog_win.title(title)
+        prog_win.geometry("350x120")
+        prog_win.transient(self.root) 
+        prog_win.grab_set() 
+        
+        prog_win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (350 // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (120 // 2)
+        prog_win.geometry(f"+{x}+{y}")
+
+        tk.Label(prog_win, text=message, font=("Arial", 10), pady=15).pack()
+        
+        progress = ttk.Progressbar(prog_win, orient="horizontal", length=280, mode="indeterminate")
+        progress.pack(pady=10)
+        progress.start(15) 
+        
+        return prog_win
+
+    # --- 修改：单点刷新逻辑，增加回调支持 ---
+    def refresh_single_engineer(self, eng_name, callback=None):
         nasuni_pattern = re.compile(r'[Nn][-_\s]?FACT')
         now_time = datetime.now()
         
@@ -447,20 +466,27 @@ class CTDataApp:
 
         self.render_engineer_cards(self.last_filtered_count)
         
-        detail_win.destroy()
-        messagebox.showinfo("更新成功", f"{eng_name} 的数据已更新，请重新点击卡片查看。")
+        # 如果有回调函数（用于刷新详情页），则执行
+        if callback:
+            callback()
 
     def show_details(self, engineer_name):
-        info = self.data[engineer_name]
-        
+        # 确保数据存在
+        if engineer_name not in self.data:
+            return
+            
         detail_win = tk.Toplevel(self.root)
         detail_win.title(f"{engineer_name} 的详细数据 (双击打开，右键菜单)")
         detail_win.geometry("850x450")
         
         summary_frame = tk.Frame(detail_win, pady=10, padx=10)
         summary_frame.pack(fill=tk.X)
-        tk.Label(summary_frame, text=f"工程师: {engineer_name}", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
-        tk.Label(summary_frame, text=f"总占用: {info['total_size_str']}", font=("Arial", 12), fg="#0066cc").pack(side=tk.RIGHT)
+        
+        name_label = tk.Label(summary_frame, text=f"工程师: {engineer_name}", font=("Arial", 12, "bold"))
+        name_label.pack(side=tk.LEFT)
+        
+        size_label = tk.Label(summary_frame, text="", font=("Arial", 12), fg="#0066cc")
+        size_label.pack(side=tk.RIGHT)
 
         columns = ("Age", "Date", "Size")
         tree = ttk.Treeview(detail_win, columns=columns)
@@ -484,40 +510,58 @@ class CTDataApp:
 
         node_data = {}
 
-        def insert_projects(parent_node, projects_list):
-            sorted_projs = sorted(projects_list, key=lambda x: x['size'], reverse=True)
-            for proj in sorted_projs:
-                tags = (proj['tag'],) if proj.get('tag') else ()
-                name_display = f"📁 {proj['name']}" if proj.get('is_dir', True) else proj['name']
+        # --- 新增：提取填充 Treeview 的独立函数 ---
+        def populate_treeview():
+            # 1. 清空现有的所有节点
+            for item in tree.get_children():
+                tree.delete(item)
+            node_data.clear()
+
+            # 2. 获取最新数据
+            if engineer_name not in self.data:
+                detail_win.destroy() # 如果数据被删空了，直接关闭窗口
+                return
                 
-                if self.tif_scanned and proj.get('tif_size', 0) > 0:
-                    name_display += f" [含TIF: {format_size(proj['tif_size'])}]"
+            info = self.data[engineer_name]
+            size_label.config(text=f"总占用: {info['total_size_str']}")
 
-                iid = tree.insert(parent_node, tk.END, text=name_display, values=(
-                    proj['age'], proj['date'], proj['size_str']
-                ), tags=tags)
-                node_data[iid] = proj
+            def insert_projects(parent_node, projects_list):
+                sorted_projs = sorted(projects_list, key=lambda x: x['size'], reverse=True)
+                for proj in sorted_projs:
+                    tags = (proj['tag'],) if proj.get('tag') else ()
+                    name_display = f"📁 {proj['name']}" if proj.get('is_dir', True) else proj['name']
+                    
+                    if self.tif_scanned and proj.get('tif_size', 0) > 0:
+                        name_display += f" [含TIF: {format_size(proj['tif_size'])}]"
 
-        if info['waiting_projects']:
-            waiting_title = f"📁 Standard CT (waiting to upload) - 共 {len(info['waiting_projects'])} 个"
-            waiting_node = tree.insert("", tk.END, text=waiting_title, values=(
-                "-", "-", format_size(info['waiting_total_size'])
-            ), tags=('group_node',))
-            insert_projects(waiting_node, info['waiting_projects'])
+                    iid = tree.insert(parent_node, tk.END, text=name_display, values=(
+                        proj['age'], proj['date'], proj['size_str']
+                    ), tags=tags)
+                    node_data[iid] = proj
 
-        if info['nasuni_projects']:
-            nasuni_title = f"📁 Standard CT (Nasuni uploaded) - 共 {len(info['nasuni_projects'])} 个"
-            nasuni_node = tree.insert("", tk.END, text=nasuni_title, values=(
-                "-", "-", format_size(info['nasuni_total_size'])
-            ), tags=('group_node',))
-            insert_projects(nasuni_node, info['nasuni_projects'])
+            if info['waiting_projects']:
+                waiting_title = f"📁 Standard CT (waiting to upload) - 共 {len(info['waiting_projects'])} 个"
+                waiting_node = tree.insert("", tk.END, text=waiting_title, values=(
+                    "-", "-", format_size(info['waiting_total_size'])
+                ), tags=('group_node',))
+                insert_projects(waiting_node, info['waiting_projects'])
 
-        if info['other_projects']:
-            other_title = f"📁 Others (非标准命名/零散文件) - 共 {len(info['other_projects'])} 个"
-            other_node = tree.insert("", tk.END, text=other_title, values=(
-                "-", "-", format_size(info['other_total_size'])
-            ), tags=('group_node',))
-            insert_projects(other_node, info['other_projects'])
+            if info['nasuni_projects']:
+                nasuni_title = f"📁 Standard CT (Nasuni uploaded) - 共 {len(info['nasuni_projects'])} 个"
+                nasuni_node = tree.insert("", tk.END, text=nasuni_title, values=(
+                    "-", "-", format_size(info['nasuni_total_size'])
+                ), tags=('group_node',))
+                insert_projects(nasuni_node, info['nasuni_projects'])
+
+            if info['other_projects']:
+                other_title = f"📁 Others (非标准命名/零散文件) - 共 {len(info['other_projects'])} 个"
+                other_node = tree.insert("", tk.END, text=other_title, values=(
+                    "-", "-", format_size(info['other_total_size'])
+                ), tags=('group_node',))
+                insert_projects(other_node, info['other_projects'])
+
+        # 初始填充数据
+        populate_treeview()
 
         scrollbar = ttk.Scrollbar(detail_win, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
@@ -557,35 +601,49 @@ class CTDataApp:
                 context_menu.add_command(label="📁 打开文件夹所在路径", command=lambda: open_path(proj['path']))
                 context_menu.add_separator()
                 
+                def execute_delete_folder(prog_win):
+                    try:
+                        if proj.get('is_dir', True):
+                            shutil.rmtree(proj['path'])
+                        else:
+                            os.remove(proj['path'])
+                        self.root.after(0, lambda: prog_win.destroy())
+                        # 传入 populate_treeview 作为回调，实现无感刷新
+                        self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, populate_treeview))
+                    except Exception as e:
+                        self.root.after(0, lambda: prog_win.destroy())
+                        self.root.after(0, lambda err=e: messagebox.showerror("删除失败", f"删除时发生错误:\n{err}"))
+
                 def delete_folder():
                     if messagebox.askyesno("确认删除", f"⚠️ 警告！\n请确认删除文件夹：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
-                        try:
-                            if proj.get('is_dir', True):
-                                shutil.rmtree(proj['path'])
-                            else:
-                                os.remove(proj['path'])
-                            self.refresh_single_engineer(engineer_name, detail_win)
-                        except Exception as e:
-                            messagebox.showerror("删除失败", f"删除时发生错误:\n{e}")
+                        prog_win = self.show_progress_dialog("正在删除", "正在删除数据，请耐心等待...")
+                        threading.Thread(target=execute_delete_folder, args=(prog_win,), daemon=True).start()
                             
                 context_menu.add_command(label="❌ 删除整个文件夹", command=delete_folder)
                 
+                def execute_delete_tifs(prog_win):
+                    try:
+                        deleted_count = 0
+                        for root_dir, _, files in os.walk(proj['path']):
+                            for file in files:
+                                filename_lower = file.lower()
+                                if filename_lower.endswith(('.tif', '.tiff')) and \
+                                   "bright" not in filename_lower and "dark" not in filename_lower:
+                                    os.remove(os.path.join(root_dir, file))
+                                    deleted_count += 1
+                        
+                        self.root.after(0, lambda: prog_win.destroy())
+                        self.root.after(0, lambda c=deleted_count: messagebox.showinfo("清理完成", f"成功删除了 {c} 个 TIF 文件。\n(已保留校准文件)"))
+                        # 传入 populate_treeview 作为回调，实现无感刷新
+                        self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, populate_treeview))
+                    except Exception as e:
+                        self.root.after(0, lambda: prog_win.destroy())
+                        self.root.after(0, lambda err=e: messagebox.showerror("删除失败", f"删除 TIF 时发生错误:\n{err}"))
+
                 def delete_tifs():
                     if messagebox.askyesno("确认删除", f"⚠️ 请确认删除此文件夹中的所有 TIF 文件\n(将自动保留包含 bright 和 dark 的校准文件)：\n{proj['name']}\n\n此操作不可逆！", icon='warning'):
-                        try:
-                            deleted_count = 0
-                            for root_dir, _, files in os.walk(proj['path']):
-                                for file in files:
-                                    filename_lower = file.lower()
-                                    # 删除规则：是 TIF 且不包含 bright/dark
-                                    if filename_lower.endswith(('.tif', '.tiff')) and \
-                                       "bright" not in filename_lower and "dark" not in filename_lower:
-                                        os.remove(os.path.join(root_dir, file))
-                                        deleted_count += 1
-                            messagebox.showinfo("清理完成", f"成功删除了 {deleted_count} 个 TIF 文件。\n(已保留校准文件)")
-                            self.refresh_single_engineer(engineer_name, detail_win)
-                        except Exception as e:
-                            messagebox.showerror("删除失败", f"删除 TIF 时发生错误:\n{e}")
+                        prog_win = self.show_progress_dialog("正在清理 TIF", "正在遍历并删除 TIF 文件，请耐心等待...")
+                        threading.Thread(target=execute_delete_tifs, args=(prog_win,), daemon=True).start()
 
                 state = tk.NORMAL if (self.tif_scanned and proj.get('is_dir', True)) else tk.DISABLED
                 context_menu.add_command(label="🗑️ 删除此文件夹里的 TIF", command=delete_tifs, state=state)
