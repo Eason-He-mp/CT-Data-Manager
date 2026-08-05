@@ -10,6 +10,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import platform
 import subprocess
 
+def center_window(window, width, height):
+    """将指定的窗口放置在屏幕正中央"""
+    window.update_idletasks()
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    x = (screen_width // 2) - (width // 2)
+    y = (screen_height // 2) - (height // 2)
+    window.geometry(f'{width}x{height}+{x}+{y}')
+
 def get_dir_size(start_path):
     total_size = 0
     dirs_to_process = [start_path]
@@ -58,9 +67,11 @@ def get_age_status_and_tag(creation_date, now):
 class CTDataApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CT 数据容量统计工具 (智能穿透 & TIF清理版)")
-        self.root.geometry("1000x650")
+        self.root.title("CT 数据容量统计工具")
         self.root.configure(bg="#f0f0f0")
+        
+        # 主窗口居中显示
+        center_window(self.root, 1000, 650)
         
         self.data = {} 
         self.tif_scanned = False
@@ -429,14 +440,9 @@ class CTDataApp:
     def show_progress_dialog(self, title, message):
         prog_win = tk.Toplevel(self.root)
         prog_win.title(title)
-        prog_win.geometry("350x120")
+        center_window(prog_win, 350, 120)
         prog_win.transient(self.root) 
         prog_win.grab_set() 
-        
-        prog_win.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (350 // 2)
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (120 // 2)
-        prog_win.geometry(f"+{x}+{y}")
 
         tk.Label(prog_win, text=message, font=("Arial", 10), pady=15).pack()
         
@@ -446,7 +452,6 @@ class CTDataApp:
         
         return prog_win
 
-    # --- 修改：单点刷新逻辑，增加回调支持 ---
     def refresh_single_engineer(self, eng_name, callback=None):
         nasuni_pattern = re.compile(r'[Nn][-_\s]?FACT')
         now_time = datetime.now()
@@ -466,18 +471,18 @@ class CTDataApp:
 
         self.render_engineer_cards(self.last_filtered_count)
         
-        # 如果有回调函数（用于刷新详情页），则执行
         if callback:
             callback()
 
     def show_details(self, engineer_name):
-        # 确保数据存在
         if engineer_name not in self.data:
             return
             
         detail_win = tk.Toplevel(self.root)
         detail_win.title(f"{engineer_name} 的详细数据 (双击打开，右键菜单)")
-        detail_win.geometry("850x450")
+        
+        # 详情页居中显示
+        center_window(detail_win, 850, 450)
         
         summary_frame = tk.Frame(detail_win, pady=10, padx=10)
         summary_frame.pack(fill=tk.X)
@@ -510,16 +515,13 @@ class CTDataApp:
 
         node_data = {}
 
-        # --- 新增：提取填充 Treeview 的独立函数 ---
         def populate_treeview():
-            # 1. 清空现有的所有节点
             for item in tree.get_children():
                 tree.delete(item)
             node_data.clear()
 
-            # 2. 获取最新数据
             if engineer_name not in self.data:
-                detail_win.destroy() # 如果数据被删空了，直接关闭窗口
+                detail_win.destroy() 
                 return
                 
             info = self.data[engineer_name]
@@ -560,7 +562,10 @@ class CTDataApp:
                 ), tags=('group_node',))
                 insert_projects(other_node, info['other_projects'])
 
-        # 初始填充数据
+            # 刷新完成后，将详情页置顶并获取焦点
+            detail_win.lift()
+            detail_win.focus_force()
+
         populate_treeview()
 
         scrollbar = ttk.Scrollbar(detail_win, orient=tk.VERTICAL, command=tree.yview)
@@ -608,7 +613,6 @@ class CTDataApp:
                         else:
                             os.remove(proj['path'])
                         self.root.after(0, lambda: prog_win.destroy())
-                        # 传入 populate_treeview 作为回调，实现无感刷新
                         self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, populate_treeview))
                     except Exception as e:
                         self.root.after(0, lambda: prog_win.destroy())
@@ -634,7 +638,6 @@ class CTDataApp:
                         
                         self.root.after(0, lambda: prog_win.destroy())
                         self.root.after(0, lambda c=deleted_count: messagebox.showinfo("清理完成", f"成功删除了 {c} 个 TIF 文件。\n(已保留校准文件)"))
-                        # 传入 populate_treeview 作为回调，实现无感刷新
                         self.root.after(0, lambda: self.refresh_single_engineer(engineer_name, populate_treeview))
                     except Exception as e:
                         self.root.after(0, lambda: prog_win.destroy())
